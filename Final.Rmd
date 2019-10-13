@@ -1,0 +1,1614 @@
+---
+title: "Locally Adaptive Bayesian Function Estimation"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+# Preloaded Function
+
+Functions to generate data.
+
+```{r,echo=FALSE,warning=FALSE}
+library('MASS')
+library('ggplot2')
+library(plotly)
+
+SineFunction <- function(n,amp=1){
+  y <- rep(0,n)
+  for(i in 1:n){
+    y[i] <- amp*sin(i)
+  }
+  return(y)
+}
+
+ConstantFunction <- function(n, upper=NULL, lower=NULL){
+  # Generate a sample of response from constant function
+  #
+  # Args:
+  #   n     : Number of index.
+  #   lower : Lower bound of function.Should it remain null, function will generate a value.
+  #   upper : Upper bound of function. Should it remain null, function will generate a value.
+  #
+  # Returns:
+  #   Vector of reponses.
+  if(is.null(lower)){lower <- runif(1,-100,100)}
+  if(is.null(upper)){upper <- runif(1,lower,100)}
+  y <- rep(runif(1,lower,upper),n)
+  return(y)
+}
+
+LinearFunction<-function(n, alpha=NULL, beta=NULL){
+  # Generate a sample of response from linear function
+  #
+  # Args:
+  #   n     : Number of index.
+  #   alpha : The intercept. Should it remain null, function will generate a value.
+  #   beta  : The gradient. Should it remain null, function will generate a value.
+  #
+  # Returns:
+  #   Vector of reponses.
+  if(is.null(alpha)){alpha <- runif(1,-100,100)}
+  if(is.null(beta)){beta <- runif(1,-100,100)}
+  y <- rep(0,n)
+  for(i in 1:n){y[i]<-alpha+beta*i}
+  return(y)
+}
+
+QuadraticFunction<-function(n,sign=NULL,intercept=NULL,steepness=NULL, translated=NULL){
+  # Generate a sample of response from quadratic function in the form of:
+  #             
+  #               y <- sign*steepness(x-translated)^2 + intercept.
+  #
+  # Args:
+  #   n         : Number of index.
+  #   sign      : Determines if quadratic function is concave or convex.
+  #   Intercept : y-axis intercept.
+  #   steepness : how steep the function is.
+  #
+  # Returns:
+  #   Vector of reponses.
+  y <- rep(0,n)
+  if(is.null(sign)){
+    sign <- runif(1,0,1)
+    if(sign>0.5){
+      sign <- 1
+    }else{
+      sign <- -1
+    }
+  }
+  if(is.null(intercept)){intercept <- runif(1,-100,100)}
+  if(is.null(steepness)){steepness <- runif(1,0,100)}
+  if(is.null(translated)){translated <- runif(1,0,n)}
+  for(i in 1:n){
+    y[i]<-sign*steepness*(i-translated)^2+intercept
+  }
+  return(y)
+}
+
+StepFunction<-function(n){
+  # Generate a sample of response from step function
+  #
+  # Args:
+  #   n     : Number of index.
+  #   m     : Number of step.
+  #
+  # Returns:
+  #   Vector of reponses.
+  y <- rep(0,n)
+  startingValue <- round(runif(1,0,n))
+  len <- round(runif(1,0,n-startingValue))
+  for(i in startingValue:(startingValue+len)){
+    y[i]<-10
+  }
+  return(y)
+}
+getKG1D <- function(n=40, delta=1){
+  
+  K <- matrix(0, n, n)
+
+    for (iy in 1:n){
+      for (jx in 1:n){
+          K[iy,jx] <- dnorm(jx-iy, 0, delta)
+      }   
+      K[iy,] <- K[iy,]/sum(K[iy,])
+    }
+
+  return(K)
+}
+
+ToProb <- function(BICVec){
+  prob <- rep(NA, length(BICVec))
+  for (i in 1:length(BICVec)) {
+    prob[i] <- exp(BICVec[i])/sum(exp(BICVec))
+  }
+  return(prob)
+}
+checkInverse <- function(m) class(try(solve(m),silent=T))=="matrix"
+```
+
+## Glmnet Ridge Regression
+This is using the glmnet packages to use cross validate wether I've implemented Ridge regression correctly, which I think I have. This could be used later for Lasso regression in our method to reconstruct our parameter.
+```{r cache=TRUE}
+FitBridge <- function(X, data,sigma, a){
+  # X:  "Design" matrix.
+  # data: observation passed in.
+  # a:  the alpha parameter, 0 for ridge regression and 1 for lasso. Anything in input between 0 
+  #     and 1 is a combination of ridge and fused
+  return.data <- list()
+  library(glmnet)
+  lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+  # Setting alpha = 0 implements ridge regression
+  kfold <- length(data)*0.2
+  if(kfold < 4){
+    kfold <- 4
+  }
+  ridge_cv <- cv.glmnet(X, 
+                        data, 
+                        alpha = a, 
+                        lambda = lambdas_to_try,
+                        standardize = TRUE, 
+                        nfolds = kfold)
+  # Plot cross-validation results
+  lambda_cv <- ridge_cv$lambda.min
+  chosenTau <- lambda_cv
+  model_cv <- glmnet(X, data, alpha = a, lambda = lambda_cv, standardize = TRUE)
+  y_hat_cv <- predict(model_cv, X)
+  BIC <- -0.5*sigma^(-2)*(t(data-y_hat_cv)%*%(data-y_hat_cv)) - 0.5*log1p(length(data))*model_cv$df
+  #print(paste("FIT: ", -0.5*sigma^(-2)*(t(data-y_hat_cv)%*%(data-y_hat_cv))))
+  #print(paste("COMPLEXITY: ", 0.5*log1p(length(data))*model_cv$df))
+  
+  return.data$beta <- coef(model_cv, s=model_cv$lambda.min)
+  return.data$lambda <- chosenTau
+  return.data$max <- BIC
+  return.data$fit <- y_hat_cv
+  return.data$df <- model_cv$df
+  return.data$ridge <- ridge_cv
+  return(return.data)
+}
+```
+
+## Ridge Regression for constant function
+This is a Ridge regression for a constant regression. It produce a horizontal line but has the property that as $\lambda \rightarrow \infty$ this horizontal line shrink to 0. On the other hand as $\lambda \rightarrow 0$ then horizontal line is at $\bar{y}$.
+
+```{r cache=TRUE}
+FitConstant <- function(X,ynew, numberOfSteps,sigma){
+  return.data <- list()
+  
+  n <- length(ynew)
+  p <- ncol(X)
+  L <- diag(p)
+  BIC <- rep(NA,numberOfSteps)
+  tau <- rep(NA,numberOfSteps)
+  for(i in 1:numberOfSteps){
+    tau[i] <- (i/numberOfSteps)*100
+    beta <- solve(t(rep(1,p))%*%(t(X)%*%X + ((sigma^2)/(tau[i]^2)*t(L)%*%L))%*%rep(1,p))%*%t(rep(1,p))%*%t(X)%*%ynew
+    beta <- matrix(beta*rep(1,p),ncol=1)
+    BIC[i] <- -1/(2*sigma^2)*t(ynew-X%*%beta)%*%(ynew-X%*%beta) - (1/2)*log1p(n)  
+  }
+  max = max(BIC, na.rm=TRUE)
+  maxTau <- 0
+  for(j in 1:numberOfSteps){
+    if(!is.na(BIC[j])){
+      if(BIC[j]==max){
+        maxTau <- tau[j]
+        B <- solve(t(rep(1,p))%*%(t(X)%*%X + ((sigma^2)/(maxTau^2)*t(L)%*%L))%*%rep(1,p))%*%t(rep(1,p))%*%t(X)
+        beta <- B%*%ynew
+        Cov <- sigma*B%*%t(B)
+      }
+    }
+  }
+  beta <- matrix(beta*rep(1,p),ncol=1)
+  return.data$beta <- beta
+  return.data$maxBIC <- max
+  return.data$BIC <- BIC
+  return.data$maxTau <- maxTau
+  return.data$Cov <- diag(Cov)
+  return.data$fit <- X%*%beta
+  return(return.data)
+}
+```
+
+## Generalised Ridge Regression
+FitRidge function is a generalised ridge regression where if $L$ matrix is not specified then this is a ordinary Ridge regression. The formula for generalised ridge regression is:
+$$
+\underline{\hat{f}}_{p\times 1} = (X^T_{p\times n}X_{n\times p}+\lambda* L^T_{p\times m}L_{m\times p})^{-1}X^T_{p\times n}\underline{y}_{n\times 1}
+$$
+### Efficient Implementation.
+The problem here is computing the inverse when $p$ is large. There is a small trick in order to reduce the time it takes to invert. This is only appropriet when $n$ is small. The trick is to use single value decomposition on $X_{n\times p} = U_{n\times k}D_{k\times n}V^T_{n\times p}$. SVD of $X_{n\times p}$ means the matrix $V_{p\times n}$ is orthogonal hence our estimates is:
+$$
+\underline{\hat{f}}_{p\times 1} = (V_{p\times n}R_{n\times n}^TR_{n\times n}V^T_{n\times p} + \lambda *L^T_{p\times m}L_{m\times p})^{-1}X^T_{p\times n}\underline{y}_{n\times 1}
+$$
+let $\Delta = L^T_{p\times m}L_{m\times p}$ then we can apply the same decomposition to $\Delta$ using $V_{p\times n}$ hence $\Delta = V_{p\times n}\Lambda V^T_{n\times p}$ hence:
+$$
+\underline{\hat{f}}_{p\times 1} = V_{p\times n}(D^T_{n\times k}D_{k\times n} + \lambda *\Lambda_{n\times n})^{-1}D^T_{n\times k}U^T_{k \times n}\underline{y}_{n\times 1}
+$$
+Hence $(R_{n\times n}^TR_{n\times n} + \lambda *\Lambda)^{-1}$ is a $n\times n$ matrix which is the number of observation. Hence we can controll the size of the inverse matrix.
+
+<u>SVD Implementation</u>
+
+```{r eval=FALSE}
+checkInverse <- function(m) class(try(solve(m),silent=T))=="matrix"
+FitRidge <- function(X, y, L = NA, sigma, min , max){
+  return.data <- list()
+  SVD <- svd(K)
+  if(is.na(L)){
+    L <- diag(ncol(K))
+  }
+  
+  tau_to_try <- 10^seq(min, max, length.out = 100)
+  BIC <- rep(NA, length(tau_to_try))
+  
+  for(i in 1:length(tau_to_try)){
+    beta <- SVD$v%*%solve(diag(SVD$d)%*%diag(SVD$d) + (sigma^2/tau_to_try[i]^2)*t(SVD$v)%*%t(L1)%*%L1%*%SVD$v, diag(SVD$d)%*%SVD$u%*%y)
+    BIC[i] <- -0.5*sigma^(-2)*t(y-K%*%beta)%*%(y-K%*%beta) - 0.5*log1p(length(y))*sum(diag(K%*%solve(t(K)%*%K + (sigma^2/tau_to_try[i]^2)*t(L)%*%L)%*%t(K)))
+  }
+  
+  maxBIC <- max(BIC, na.rm = TRUE)
+  maxTau <- NA
+  fit <- rep(NA,length(y))
+  beta <- rep(NA, ncol(X))
+  for (i in 1:length(BIC)) {
+    if(!is.na(BIC[i])){
+      if(BIC[i]==maxBIC){
+        maxTau <- tau_to_try[i]
+        #print(maxTau)
+        beta <- solve(t(K)%*%K + (sigma^2/maxTau^2)*t(L)%*%L,t(K)%*%y)
+        fit <- K%*%beta 
+      }
+    }
+  }
+  
+  return.data$maxBIC <- maxBIC
+  return.data$BIC <- BIC
+  return.data$maxTau <- maxTau
+  return.data$beta <- beta
+  return.data$fit <- fit
+  #print(return.data)
+  return(return.data)
+}
+```
+
+<u>Non-SVD Implementation</u>
+```{r}
+FitRidge <- function(K, y, L = NA, sigma, min , max){
+  return.data <- list()
+  
+  if(is.na(L)){
+    L <- diag(ncol(K))
+  }
+  
+  tau_to_try <- 10^seq(min, max, length.out = 100)
+  BIC <- rep(NA, length(tau_to_try))
+  
+  for(i in 1:length(tau_to_try)){
+    if(checkInverse(t(K)%*%K + (sigma^2/tau_to_try[i]^2)*t(L)%*%L)){
+      beta <- solve(t(K)%*%K + (sigma^2/tau_to_try[i]^2)*t(L)%*%L, t(K)%*%y)
+      BIC[i] <- -0.5*sigma^(-2)*t(y-K%*%beta)%*%(y-K%*%beta) - 0.5*log1p(length(y))*sum(diag(K%*%solve(t(K)%*%K + (sigma^2/tau_to_try[i]^2)*t(L)%*%L)%*%t(K)))
+    }else{
+      #print(tau_to_try[i])
+    }
+  }
+  
+  maxBIC <- max(BIC, na.rm = TRUE)
+  maxTau <- 0.1
+  fit <- rep(NA,length(y))
+  beta <- rep(NA, ncol(K))
+  for (i in 1:length(BIC)) {
+    if(!is.na(BIC[i])){
+      if(BIC[i]==maxBIC){
+        maxTau <- tau_to_try[i]
+        #print(maxTau)
+        beta <- solve(t(K)%*%K + (sigma^2/maxTau^2)*t(L)%*%L,t(K)%*%y)
+        fit <- K%*%beta 
+      }
+    }
+  }
+  
+  return.data$maxBIC <- maxBIC
+  return.data$BIC <- BIC
+  return.data$maxTau <- maxTau
+  return.data$beta <- beta
+  return.data$fit <- fit
+  #print(return.data)
+  return(return.data)
+}
+```
+
+## Simulated Data
+
+Randomly generated data for our method to use.
+
+```{r cache=TRUE}
+
+m <- 100
+# the width of each function, default is 10. This mean each function generated occupy 10 values.
+numberOfFunction <- 2
+functionWidth <- m/numberOfFunction
+y <- rep(0,m)
+for(i in 1:numberOfFunction){
+  ran <- 1#round(runif(1,0.75,3.25))
+  if(ran==1){
+    temp <- ConstantFunction(functionWidth)
+    for(j in 1:length(temp)){
+      y[(i-1)*functionWidth+j] <- temp[j]
+    }
+  }
+  if(ran==2){
+    temp <- c(LinearFunction(functionWidth))
+    for(j in 1:length(temp)){
+      y[(i-1)*functionWidth+j] <- temp[j]
+    }
+  }
+  if(ran==3){
+    temp <- c(QuadraticFunction(functionWidth))
+    for(j in 1:length(temp)){
+      y[(i-1)*functionWidth+j] <- temp[j]
+    }
+  }
+}
+
+# Add noise to the data
+sigma <- 0.5
+K <- getKG1D(n=length(y),delta = 3)
+n <- m
+Covariance <- sigma^2*diag(n)
+mu <- rep(0,m)
+f <- y
+ynew <- K%*%f + mvrnorm(1,mu,Covariance)
+min <- min(c(y,ynew))
+max <- max(c(y,ynew))
+plot(y=y,x=c(1:m), type="l", xlab = "", ylim = c(min,max), ylab = "")
+points(ynew,x=c(1:m),type="p", col = "red", pch=20)
+legend("topleft", legend=c("True", "Observation"),col=c("black","red"),lty=1, cex=0.8)
+#bench_mark_obs <- ynew
+#bench_mark_f <- f
+#bench_mark_K <- K
+#bench_mark_sigma <- sigma
+```
+
+## Real data
+
+```{r cache=TRUE}
+truth1 <- read.table("truth1.dat")
+truth2 <- read.table("truth2.dat") 
+sigma <- 0.0005
+y <- truth2[,1]
+K <- getKG1D(n=length(y),delta = 1)
+Covariance <- sigma^2*diag(length(y))
+mu <- rep(0,length(y))
+ynew <- K%*%y + mvrnorm(1,mu,Covariance)
+plot(y=y,x=c(1:length(y)), type="l", xlab = "", ylim = c(min(ynew),max(ynew)), ylab = "")
+points(ynew,x=c(1:length(ynew)),type="p", col = "red", pch=20)
+legend("topleft", legend=c("True", "Observation"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+
+### Fitting Using Generalised Ridge's Regression
+
+As comparison we wish to use these to compared our method vs generalised Ridge's regression.
+
+```{r cache=TRUE}
+n <- length(ynew)
+p <- ncol(K)
+L0 <- diag(p)
+L1 <- matrix(c(-1,1,rep(0,p-1)),n-1,p, byrow <- T)
+L2 <- matrix(c(-1,2,-1,rep(0,p-2)),n-2,p, byrow <- T)
+naiveRidgeL0 <- FitRidge(K,ynew,L=L0,sigma,-5,5)
+naiveRidgeL1 <- FitRidge(K,ynew,L=L1,sigma,-5,5)
+naiveRidgeL2 <- FitRidge(K,ynew,L=L2,sigma,-5,5)
+min <- min(c(y,naiveRidgeL0$beta,naiveRidgeL1$beta,naiveRidgeL2$beta))
+max <- max(c(y,naiveRidgeL0$beta,naiveRidgeL1$beta,naiveRidgeL2$beta))
+plot(y, type="l", col="black", ylab = "", ylim=c(min,max))
+lines(naiveRidgeL1$beta, col="green")
+legend("topleft", legend=c("True", "L0","L1","L2"),col=c("black","blue","green","orange"),lty=1, cex=0.8)
+plot(y, type="l", col="black", ylab = "", ylim=c(min,max))
+lines(naiveRidgeL2$beta, col="orange")
+legend("topleft", legend=c("True", "L0","L1","L2"),col=c("black","blue","green","orange"),lty=1, cex=0.8)
+print(paste("L0 MSE: ", sum((naiveRidgeL0$beta-y)^2)," L1 MSE: ", sum((naiveRidgeL1$beta-y)^2)," L2 MSE: ", sum((naiveRidgeL2$beta-y)^2)))
+```
+
+### Animating Effect of $\tau$
+
+We can produce an animation of the effects of $\tau$ on the estimates.
+
+NOTE: This only work in R since the package used cannot animate in pdf or html.
+
+```{r echo=FALSE, eval=FALSE, cache=TRUE}
+animate.data <- data.frame()
+tau_to_try <- 10^seq(-5,5, by=1)
+n <- length(ynew)
+p <- ncol(K)
+L0 <- diag(p)
+L1 <- matrix(c(-1,1,rep(0,p-1)),n-1,p, byrow <- T)
+L2 <- matrix(c(-1,2,-1,rep(0,p-2)),n-2,p, byrow <- T)
+for(tau in tau_to_try){
+  L_0 <-  solve(t(K)%*%K + (sigma^2/tau^2)*t(L0)%*%L0,t(K)%*%y)
+  L_1 <-  solve(t(K)%*%K + (sigma^2/tau^2)*t(L1)%*%L1,t(K)%*%y)
+  L_2 <-  solve(t(K)%*%K + (sigma^2/tau^2)*t(L2)%*%L2,t(K)%*%y)
+  constant = solve(t(rep(1,p))%*%(t(K)%*%K + ((sigma^2)/(tau^2)*t(L0)%*%L0))%*%rep(1,p))%*%t(rep(1,p))%*%t(K)%*%ynew
+  constant = rep(constant, p)
+  newrow <- data.frame("tau"=tau,
+                       "X"=c(1:length(y)),
+                       "L0"=L_0,
+                       "L1"=L_1,
+                       "L2"=L_2,
+                       "const"=constant
+  )
+  animate.data <- rbind(animate.data, newrow)
+}
+```
+
+```{r warning=FALSE, eval=FALSE, echo=FALSE, cache=TRUE}
+tau <- 10^5
+plot.data <- animate.data[animate.data$tau==tau,]
+min <- min(plot.data[,c("L0","L1","L2","const")])
+max <- max(plot.data[,c("L0","L1","L2","const")])
+plot(x=plot.data$X, y=plot.data$const, type = "l", col="red", ylim = c(min,max), ylab = "", xlab = "", main = paste("Tau",tau))
+lines(x=plot.data$X,y=plot.data$L0, type="l", col="blue")
+lines(x=plot.data$X,y=plot.data$L1, type="l", col="green")
+lines(x=plot.data$X,y=plot.data$L2, type="l", col="orange")
+lines(x=plot.data$X,y=y, type="l", col="black")
+legend("topright", legend=c("True", "constant", "L0","L1","L2"),col=c("black","red", "blue","green", "orange"),lty=1, cex=0.8)
+```
+
+# Locally Adaptive Bayesian Model Selection
+
+## BIC
+
+Here we is the main code to produce estimates, fitted, $\tau$ and BIC values of each models for each window. The models here includes constant model, L0, L1 and L2 we could further add Lasso and Bridge regression but further amendment to the code will be required.
+
+```{r warning=FALSE, cache=TRUE}
+estimate.data <- data.frame()
+fitted.data <- data.frame()
+BIC.data <- data.frame()
+BICTau.data <- data.frame()
+MSE.data <- data.frame()
+
+
+windowWidth <- 10
+for (i in 1:length(ynew)) {
+  #print((i/length(ynew))*100)
+  centered <- i
+  lower <- centered - windowWidth/2
+  upper <- centered + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  data <- ynew[c(lower:upper)]
+  X <- K[c(lower:upper),]
+  
+  n <- length(ynew)
+  p <- ncol(X)
+  L0 <- diag(p)
+  L1 <- matrix(c(-1,1,rep(0,p-1)),n-1,p, byrow <- T)
+  L2 <- matrix(c(-1,2,-1,rep(0,p-2)),n-2,p, byrow <- T)
+  
+  
+  constant <- FitConstant(X,data,1000,sigma)
+  naiveRidgeL0 <- FitRidge(X,data, L = L0, sigma = sigma,-5,2)
+  #naiveRidgeL0 <- FitConstant(X,data,1000,sigma)
+  naiveRidgeL1 <- FitRidge(X,data, L = L1, sigma = sigma,-5,2)
+  #naiveRidgeL1 <- FitConstant(X,data,1000,sigma)
+  naiveRidgeL2 <- FitRidge(X,data, L = L2, sigma = sigma,-5,2)
+  #naiveRidgeL2 <- FitConstant(X,data,1000,sigma)
+  #BICVec <- c(constant$max)
+  BICVec <- c(constant$max,naiveRidgeL0$maxBIC, naiveRidgeL1$maxBIC, naiveRidgeL2$maxBIC)
+  prob <- ToProb(BICVec)
+  
+  newrow <- data.frame(
+    "window" = i,
+    "X" = c(1:length(ynew)),
+    #"X" = c(lower:upper),
+    "constantBeta" = constant$beta,
+    "L0Beta" = naiveRidgeL0$beta,
+    "L1Beta" = naiveRidgeL1$beta,
+    "L2Beta" = naiveRidgeL2$beta
+  )
+  
+  estimate.data <- rbind(estimate.data,newrow)
+  
+  newrow <- data.frame(
+    "window" = i,
+    "X" = c(lower:upper),
+    "constantFit" = constant$fit,
+    "L0Fit" = naiveRidgeL0$fit,
+    "L1Fit" = naiveRidgeL1$fit,
+    "L2Fit" = naiveRidgeL2$fit
+  )
+  
+  fitted.data <- rbind(fitted.data, newrow)
+  
+  newrow <- data.frame(
+    "window" = i,
+    "constantBIC" = constant$BIC,
+    "L0BIC" = naiveRidgeL0$BIC,
+    "L1BIC" = naiveRidgeL1$BIC,
+    "L2BIC" = naiveRidgeL2$BIC
+  )
+  
+  BIC.data <- rbind(BIC.data, newrow)
+  #print(paste("window: ", i, ",constantTau: ", naiveRidgeL0$maxTau, ",L0Tau: ", naiveRidgeL0$maxTau))
+  newrow <- data.frame(
+    "window" = i,
+    "constantTau" = constant$maxTau,
+    "L0Tau" = naiveRidgeL0$maxTau,
+    "L1Tau" = naiveRidgeL1$maxTau,
+    "L2Tau" = naiveRidgeL2$maxTau,
+    "constantBIC" = constant$maxBIC,
+    "L0BIC" = naiveRidgeL0$maxBIC,
+    "L1BIC" = naiveRidgeL1$maxBIC,
+    "L2BIC" = naiveRidgeL2$maxBIC
+  )
+  
+  BICTau.data <- rbind(BICTau.data, newrow)
+  
+  newrow <- data.frame(
+    "window"=i,
+    "constantMSE"= sum((constant$beta[lower:upper]-data)^2),
+    "L0MSE"= sum((naiveRidgeL0$beta[lower:upper]-data)^2),
+    "L1MSE"= sum((naiveRidgeL1$beta[lower:upper]-data)^2),
+    "L2MSE"= sum((naiveRidgeL2$beta[lower:upper]-data)^2)
+      )
+  MSE.data <- rbind(MSE.data, newrow)
+}
+```
+
+### Animated Estimates
+
+Here we produce an animation plot to show the intermediate stages of fitting each models to each window.
+
+NOTE: this only work in R.
+
+```{r warning=FALSE, eval=FALSE, echo=FALSE}
+plot.fitted <- estimate.data %>%
+  plot_ly(
+    x = ~ X,
+    y = ~ constantBeta,
+    frame = ~window,
+    type = 'scatter',
+    mode = 'lines',
+    name = 'Constant',
+    line = list(color = 'rgb(255,0,0)', width = 2),
+    showlegend = T
+  )%>% 
+  add_trace(y = ~ L0Beta,
+            name = 'L0', 
+            mode = 'lines',
+            line = list(color = 'rgb(0,255,255)', width = 2))%>% 
+  add_trace(y = ~ L1Beta,
+            name = 'L1', 
+            mode = 'lines',
+            line = list(color = 'rgb(255,0,255)', width = 2))%>% 
+  add_trace(y = ~ L2Beta,
+            name = 'L2', 
+            mode = 'lines',
+            line = list(color = 'rgb(255,255,0)', width = 2))
+
+
+ggplotly(plot.fitted, height = 900, width = 700, scale_y_continuous(limits = c(min(ynew), max(ynew)))) %>%
+        animation_opts(frame = 300,
+                       easing = "exp-out",
+                       redraw = FALSE)
+```
+
+## Stacked Percentage Plot of Posterior with $\alpha \rightarrow \infty$
+
+```{r}
+
+prob.data <- data.frame()
+temp <- BICTau.data[,c("constantBIC","L0BIC","L1BIC","L2BIC")]
+for (row in 1:nrow(temp)){
+  #print(row)
+  BIC <- temp[row,]
+  prob <- rep(NA, length(BIC))
+  prob[1] <- exp(BIC[1])/sum(exp(BIC))
+  prob[2] <- exp(BIC[2])/sum(exp(BIC))
+  prob[3] <- exp(BIC[3])/sum(exp(BIC))
+  prob[4] <- exp(BIC[4])/sum(exp(BIC))
+  #print(prob)
+  prob.data <- rbind(prob.data,prob)
+}
+colnames(prob.data) <- c("Const","L0","L1","L2")
+rownames(prob.data) <- c(1:nrow(prob.data))
+col <- rep(c("red","blue","green","orange"),40)
+barplot(t(prob.data),
+        xlab = "Window",
+        ylab = "probability",
+        col = col,
+        legend.text = TRUE,
+        args.legend=list(
+          x=ncol(t(prob.data)) + 35,
+          y=max(colSums(t(prob.data))),
+          bty = "n"
+        ))
+
+```
+
+### BIC Plot of Model
+
+```{r}
+temp <- BICTau.data[,c("constantBIC","L0BIC","L1BIC","L2BIC")]
+rownames(temp) <- c(1:nrow(prob.data))
+col <- rep(c("red","blue","green","orange"),40)
+barplot(t(temp), 
+        col=col,
+        legend.text = TRUE,
+        args.legend=list(
+          x=ncol(t(temp)) + 30,
+          y=max(colSums(t(temp))),
+          bty = "n"
+        ))
+```
+
+## Within-Window Posterior Average
+
+```{r}
+interWindowAverage.data <- data.frame()
+for (w in 1:length(ynew)) {
+  lower <- w - windowWidth/2
+  upper <- w + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  estimate <- prob.data[w,]$Const*estimate.data[estimate.data$window==w,"constantBeta"] + prob.data[w,]$L0*estimate.data[estimate.data$window==w,"L0Beta"] + prob.data[w,]$L1*estimate.data[estimate.data$window==w,"L1Beta"] + prob.data[w,]$L2*estimate.data[estimate.data$window==w,"L2Beta"]
+  newrow <- data.frame(
+    "window" = w,
+    "X" = c(lower:upper),
+    "estimate" = estimate[c(lower:upper)]
+  )
+  interWindowAverage.data <- rbind(interWindowAverage.data, newrow)
+}
+```
+
+```{r, echo=FALSE, eval=FALSE}
+plot.fitted <- interWindowAverage.data %>%
+  plot_ly(
+    x = ~ X,
+    y = ~ estimate,
+    frame = ~window,
+    type = 'scatter',
+    mode = 'lines',
+    name = 'Constant',
+    line = list(color = 'rgb(255,0,0)', width = 2),
+    showlegend = T
+  )
+ggplotly(plot.fitted, height = 900, width = 700) %>%
+        animation_opts(frame = 300,
+                       easing = "exp-out",
+                       redraw = FALSE)
+```
+
+```{r}
+min <- min(interWindowAverage.data[,"estimate"])
+max <- max(interWindowAverage.data[,"estimate"])
+plot(y, type="l", col="black", ylim = c(min,max))
+for (w in 1:length(y)) {
+  lines(x=subset(interWindowAverage.data, window == w)[,"X"], y=subset(interWindowAverage.data, window == w)[,"estimate"], col="red")
+}
+```
+
+## Comparing Two Different Value of $\alpha$
+
+### Posterior with $\alpha \rightarrow \infty$
+
+```{r}
+simpleEstimate <- rep(NA, length(ynew))
+for(x in 1:length(ynew)){
+  est <- subset(interWindowAverage.data,X==x)[,"estimate"]
+  simpleEstimate[x] <- mean(est)
+}
+#par(mfrow=c(1,2))
+min <- min(c(ynew, y))
+max <- max(c(ynew, y))
+plot(simpleEstimate, type="l", col="red", main = paste("with-window Likelihood with Naive Prior, MSE:",sum((simpleEstimate-y)^2)), xlab="", ylab="", ylim = c(min,max))
+lines(y, col="black")
+#plot(K%*%simpleEstimate, col="red")
+#points(ynew, col="black")
+#points(ynew, col="blue")
+#lines(y, col="blue")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+
+```{r echo=FALSE}
+decayRate <- 1000
+expEstimate <- rep(NA, length(ynew))
+for(x in 1:length(ynew)){
+  est <- subset(interWindowAverage.data,X==x)[,c("window", "estimate")]
+  weight <- rep(NA,nrow(est))
+  for (w in 1:nrow(est)) {
+    weight[w] <- exp(-decayRate*abs(x-est[w,"window"]))
+  }
+  total <- sum(weight)
+  for (w in 1:length(weight)) {
+    weight[w] <- weight[w]/total
+  }
+  expEstimate[x] <- sum(weight*est[,"estimate"])
+  #if(is.na(sum(weight*est[,"estimate"]))){
+  #  print(paste("weight: ", weight))
+  #  print(paste("estimate: ", est[,"estimate"]))
+  #}
+}
+#par(mfrow=c(1,2))
+min <- min(c(ynew, y))
+max <- max(c(ynew, y))
+plot(expEstimate, type="l", col="red", main = paste("with-window likelihood and Exponential Prior, MSE:",sum((expEstimate-y)^2)), ylim = c(min,max))
+lines(y, col="black")
+```
+
+### Posterior when $\alpha=0$
+
+```{r warning=FALSE}
+BICEstimate <- rep(0,length(ynew))
+for (x in 1:length(ynew)) {
+  #print(paste("x: ", x))
+  prob <- data.frame()
+  lower <- x - windowWidth/2
+  upper <- x + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  BIC <- BICTau.data[c(lower:upper),c("constantBIC","L0BIC","L1BIC","L2BIC")]
+  prob <- cbind("window"=c(lower:upper),exp(BIC)/sum(exp(BIC)))
+  for (w in lower:upper) {
+    estimate <- estimate.data[estimate.data$X==x & estimate.data$window==w,]
+    BICEstimate[x] <- BICEstimate[x] + prob[prob$window==w,]$constantBIC*estimate$constantBeta + prob[prob$window==w,]$L0BIC*estimate$L0Beta + prob[prob$window==w,]$L1BIC*estimate$L1Beta + prob[prob$window==w,]$L2BIC*estimate$L2Beta
+  }
+}
+min <- min(c(BICEstimate, ynew,y))
+max <- max(c(BICEstimate, ynew,y))
+plot(BICEstimate, type="l", col="red", main = paste("Average using between-window Likelihood with Naive Prior"), xlab = "coefficients", ylab = "estimates", ylim = c(min,max))
+lines(y, col="black")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+## Average with Different Combination of Models
+
+### Single Model
+
+#### Constant
+
+##### BIC Plot
+
+```{r}
+temp <- BICTau.data[,c("constantBIC")]
+col <- rep(c("red"),40)
+barplot(t(temp), 
+        names.arg = c(1:length(temp)),
+        col=col,
+        legend.text = TRUE,
+        args.legend=list(
+          x=ncol(t(temp)) + 30,
+          y=max(colSums(t(temp))),
+          bty = "n"
+        ))
+```
+
+##### between-window Likelihood with Naive Prior
+
+```{r warning=FALSE}
+BICEstimate <- rep(0,length(ynew))
+for (x in 1:length(ynew)) {
+  #print(paste("x: ", x))
+  prob <- data.frame()
+  lower <- x - windowWidth/2
+  upper <- x + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  BIC <- BICTau.data[c(lower:upper),c("constantBIC")]
+  prob <- cbind("window"=c(lower:upper),"constantBIC"=exp(BIC)/sum(exp(BIC)))
+  for (w in lower:upper) {
+    estimate <- estimate.data[estimate.data$X==x & estimate.data$window==w,]
+    BICEstimate[x] <- BICEstimate[x] + prob[w-lower+1,2]*estimate$constantBeta #+ prob[prob$window==w,]$L0BIC*estimate$L0Beta + prob[prob$window==w,]$L1BIC*estimate$L1Beta + prob[prob$window==w,]$L2BIC*estimate$L2Beta
+  }
+}
+min <- min(c(BICEstimate, ynew,y))
+max <- max(c(BICEstimate, ynew,y))
+plot(BICEstimate, type="l", col="red", main = paste("Average using between-window Likelihood with Naive Prior"), xlab = "coefficients", ylab = "estimates", ylim = c(min,max))
+lines(y, col="black")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+##### between-window Likelihood with Exponential Prior
+
+```{r warning=FALSE}
+BICEstimate <- rep(0,length(ynew))
+alpha <- 4
+for (x in 1:length(ynew)) {
+  #print(paste("x: ", x))
+  prob <- data.frame()
+  lower <- x - windowWidth/2
+  upper <- x + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  BIC <- BICTau.data[c(lower:upper),c("constantBIC")]
+  prob <- cbind("window"=c(lower:upper),"constantBIC"=exp(BIC)/sum(exp(BIC)))
+  
+  # Exponential Weighting
+  prior <- c(lower:upper)
+  for(i in 1:length(prior)){
+    prior[i] <- exp(-alpha*abs(prior[i]-x))
+  }
+  prior <- prior/sum(prior)
+  
+  for(w in lower:upper){
+    prob[w-lower+1,2] <- prior[w - lower + 1]*prob[w-lower+1,2]
+  }
+  prob[,2] <- prob[,2]/sum(prob[,2])
+  
+  for(w in lower:upper) {
+    estimate <- estimate.data[estimate.data$X==x & estimate.data$window==w,]
+    BICEstimate[x] <- BICEstimate[x] + prob[w-lower+1,2]*estimate$constantBeta
+  }
+}
+min <- min(c(BICEstimate, ynew,y))
+max <- max(c(BICEstimate, ynew,y))
+plot(BICEstimate, type="l", col="red", main = paste("between-window Likelihood with Exponential Prior, MSE:",sum((BICEstimate-y)^2)), xlab = "coefficients", ylab = "estimates", ylim = c(min,max))
+lines(y, col="black")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+#### L0 Model
+
+##### between-window Likelihood with Naive Prior
+
+```{r warning=FALSE}
+BICEstimate <- rep(0,length(ynew))
+for (x in 1:length(ynew)) {
+  #print(paste("x: ", x))
+  prob <- data.frame()
+  lower <- x - windowWidth/2
+  upper <- x + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  BIC <- BICTau.data[c(lower:upper),c("L0BIC")]
+  prob <- cbind("window"=c(lower:upper),"L0BIC"=exp(BIC)/sum(exp(BIC)))
+  for (w in lower:upper) {
+    estimate <- estimate.data[estimate.data$X==x & estimate.data$window==w,]
+    BICEstimate[x] <- BICEstimate[x] + prob[w-lower+1,2]*estimate$L0Beta
+  }
+}
+min <- min(c(BICEstimate, ynew,y))
+max <- max(c(BICEstimate, ynew,y))
+plot(BICEstimate, type="l", col="red", main = paste("Average using between-window Likelihood with Naive Prior, MSE:",sum((BICEstimate-y)^2)), xlab = "coefficients", ylab = "estimates", ylim = c(min,max))
+lines(y, col="black")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+##### between-window Likelihood with Exponential Prior
+
+```{r warning=FALSE}
+BICEstimate <- rep(0,length(ynew))
+alpha <- 0.3
+for (x in 1:length(ynew)) {
+  #print(paste("x: ", x))
+  prob <- data.frame()
+  lower <- x - windowWidth/2
+  upper <- x + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  BIC <- BICTau.data[c(lower:upper),c("L0BIC")]
+  prob <- cbind("window"=c(lower:upper),"L0BIC"=exp(BIC)/sum(exp(BIC)))
+  
+  # Exponential Weighting
+  prior <- c(lower:upper)
+  for(i in 1:length(prior)){
+    prior[i] <- exp(-alpha*abs(prior[i]-x))
+  }
+  prior <- prior/sum(prior)
+  
+  for(w in lower:upper){
+    prob[w-lower+1,2] <- prior[w - lower + 1]*prob[w-lower+1,2]
+  }
+  prob[,2] <- prob[,2]/sum(prob[,2])
+  
+  for(w in lower:upper) {
+    estimate <- estimate.data[estimate.data$X==x & estimate.data$window==w,]
+    BICEstimate[x] <- BICEstimate[x] + prob[w-lower+1,2]*estimate$L0Beta
+  }
+}
+min <- min(c(BICEstimate, ynew,y))
+max <- max(c(BICEstimate, ynew,y))
+plot(BICEstimate, type="l", col="red", main = paste("between-window Likelihood with Exponential Prior, MSE:",sum((BICEstimate-y)^2)), xlab = "coefficients", ylab = "estimates", ylim = c(min,max))
+lines(y, col="black")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+#### L1 Model
+
+##### between-window Likelihood with Naive Prior
+
+```{r warning=FALSE}
+BICEstimate <- rep(0,length(ynew))
+for (x in 1:length(ynew)) {
+  #print(paste("x: ", x))
+  prob <- data.frame()
+  lower <- x - windowWidth/2
+  upper <- x + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  BIC <- BICTau.data[c(lower:upper),c("L1BIC")]
+  prob <- cbind("window"=c(lower:upper),"L1BIC"=exp(BIC)/sum(exp(BIC)))
+  for (w in lower:upper) {
+    estimate <- estimate.data[estimate.data$X==x & estimate.data$window==w,]
+    BICEstimate[x] <- BICEstimate[x] + prob[w-lower+1,2]*estimate$L1Beta
+  }
+}
+min <- min(c(BICEstimate, ynew,y))
+max <- max(c(BICEstimate, ynew,y))
+plot(BICEstimate, type="l", col="red", main = paste("Average using between-window Likelihood with Naive Prior, MSE:",sum((BICEstimate-y)^2)), xlab = "coefficients", ylab = "estimates", ylim = c(min,max))
+lines(y, col="black")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+##### between-window Likelihood with Exponential Prior
+
+```{r warning=FALSE}
+BICEstimate <- rep(0,length(ynew))
+alpha <- 0.01
+for (x in 1:length(ynew)) {
+  #print(paste("x: ", x))
+  prob <- data.frame()
+  lower <- x - windowWidth/2
+  upper <- x + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  BIC <- BICTau.data[c(lower:upper),c("L1BIC")]
+  prob <- cbind("window"=c(lower:upper),"L1BIC"=exp(BIC)/sum(exp(BIC)))
+  
+  # Exponential Weighting
+  prior <- c(lower:upper)
+  for(i in 1:length(prior)){
+    prior[i] <- exp(-alpha*abs(prior[i]-x))
+  }
+  prior <- prior/sum(prior)
+  
+  for(w in lower:upper){
+    prob[w-lower+1,2] <- prior[w - lower + 1]*prob[w-lower+1,2]
+  }
+  prob[,2] <- prob[,2]/sum(prob[,2])
+  
+  for(w in lower:upper) {
+    estimate <- estimate.data[estimate.data$X==x & estimate.data$window==w,]
+    BICEstimate[x] <- BICEstimate[x] + prob[w-lower+1,2]*estimate$L1Beta
+  }
+}
+min <- min(c(BICEstimate, ynew,y))
+max <- max(c(BICEstimate, ynew,y))
+plot(BICEstimate, type="l", col="red", main = paste("between-window Likelihood with Exponential Prior, MSE:",sum((BICEstimate-y)^2)), xlab = "coefficients", ylab = "estimates", ylim = c(min,max))
+lines(y, col="black")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+#### L2 Model
+
+##### between-window Likelihood with Naive Prior
+
+```{r warning=FALSE}
+BICEstimate <- rep(0,length(ynew))
+for (x in 1:length(ynew)) {
+  #print(paste("x: ", x))
+  prob <- data.frame()
+  lower <- x - windowWidth/2
+  upper <- x + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  BIC <- BICTau.data[c(lower:upper),c("L2BIC")]
+  prob <- cbind("window"=c(lower:upper),"L2BIC"=exp(BIC)/sum(exp(BIC)))
+  for (w in lower:upper) {
+    estimate <- estimate.data[estimate.data$X==x & estimate.data$window==w,]
+    BICEstimate[x] <- BICEstimate[x] + prob[w-lower+1,2]*estimate$L2Beta
+  }
+}
+min <- min(c(BICEstimate, ynew,y))
+max <- max(c(BICEstimate, ynew,y))
+plot(BICEstimate, type="l", col="red", main = paste("Average using between-window Likelihood with Naive Prior, MSE:",sum((BICEstimate-y)^2)), xlab = "coefficients", ylab = "estimates", ylim = c(min,max))
+lines(y, col="black")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+##### between-window Likelihood with Exponential Prior
+
+```{r warning=FALSE}
+BICEstimate <- rep(0,length(ynew))
+alpha <- 1
+for (x in 1:length(ynew)) {
+  #print(paste("x: ", x))
+  prob <- data.frame()
+  lower <- x - windowWidth/2
+  upper <- x + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  BIC <- BICTau.data[c(lower:upper),c("L2BIC")]
+  prob <- cbind("window"=c(lower:upper),"L2BIC"=exp(BIC)/sum(exp(BIC)))
+  
+  # Exponential Weighting
+  prior <- c(lower:upper)
+  for(i in 1:length(prior)){
+    prior[i] <- exp(-alpha*abs(prior[i]-x))
+  }
+  prior <- prior/sum(prior)
+  
+  for(w in lower:upper){
+    prob[w-lower+1,2] <- prior[w - lower + 1]*prob[w-lower+1,2]
+  }
+  prob[,2] <- prob[,2]/sum(prob[,2])
+  
+  for(w in lower:upper) {
+    estimate <- estimate.data[estimate.data$X==x & estimate.data$window==w,]
+    BICEstimate[x] <- BICEstimate[x] + prob[w-lower+1,2]*estimate$L2Beta
+  }
+}
+min <- min(c(BICEstimate, ynew,y))
+max <- max(c(BICEstimate, ynew,y))
+plot(BICEstimate, type="l", col="red", main = paste("between-window Likelihood with Exponential Prior, MSE:",sum((BICEstimate-y)^2)), xlab = "coefficients", ylab = "estimates", ylim = c(min,max))
+lines(y, col="black")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+### Two Models
+#### Constant with L0
+##### with-window likelihood
+
+```{r warning=FALSE}
+prob.data <- data.frame()
+temp <- BICTau.data[,c("constantBIC","L0BIC")]
+for (row in 1:nrow(temp)){
+  #print(row)
+  BIC <- temp[row,]
+  prob <- rep(NA, length(BIC))
+  prob[1] <- exp(BIC[1])/sum(exp(BIC))
+  prob[2] <- exp(BIC[2])/sum(exp(BIC))
+  #prob[3] <- exp(BIC[3])/sum(exp(BIC))
+  #prob[4] <- exp(BIC[4])/sum(exp(BIC))
+  #print(prob)
+  prob.data <- rbind(prob.data,prob)
+}
+colnames(prob.data) <- c("Const","L0")
+rownames(prob.data) <- c(1:nrow(prob.data))
+col <- rep(c("red","blue"),40)
+barplot(t(prob.data),
+        xlab = "Window",
+        ylab = "probability",
+        col = col,
+        legend.text = TRUE,
+        args.legend=list(
+          x=ncol(t(prob.data)) + 35,
+          y=max(colSums(t(prob.data))),
+          bty = "n"
+        ))
+```
+
+
+```{r warning=FALSE, echo=FALSE}
+interWindowAverage.data <- data.frame()
+for (w in 1:length(ynew)) {
+  lower <- w - windowWidth/2
+  upper <- w + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  estimate <- prob.data[w,]$Const*estimate.data[estimate.data$window==w,"constantBeta"] + prob.data[w,]$L0*estimate.data[estimate.data$window==w,"L0Beta"] #+ prob.data[w,]$L1*estimate.data[estimate.data$window==w,"L1Beta"] + prob.data[w,]$L2*estimate.data[estimate.data$window==w,"L2Beta"]
+  newrow <- data.frame(
+    "window" = w,
+    "X" = c(lower:upper),
+    "estimate" = estimate[c(lower:upper)]
+  )
+  interWindowAverage.data <- rbind(interWindowAverage.data, newrow)
+}
+```
+
+Naive Prior
+
+```{r warning=FALSE, echo=FALSE}
+simpleEstimate <- rep(NA, length(ynew))
+for(x in 1:length(ynew)){
+  est <- subset(interWindowAverage.data,X==x)[,"estimate"]
+  simpleEstimate[x] <- mean(est)
+}
+#par(mfrow=c(1,2))
+min <- min(c(ynew, y))
+max <- max(c(ynew, y))
+plot(simpleEstimate, type="l", col="red", main = paste("with-window Likelihood with Naive Prior, MSE:",sum((simpleEstimate-y)^2)), xlab="", ylab="", ylim = c(min,max))
+lines(y, col="black")
+#plot(K%*%simpleEstimate, col="red")
+#points(ynew, col="black")
+#points(ynew, col="blue")
+#lines(y, col="blue")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+Exponential Prior
+```{r warning=FALSE}
+decayRate <- 0.0001
+expEstimate <- rep(NA, length(ynew))
+for(x in 1:length(ynew)){
+  est <- subset(interWindowAverage.data,X==x)[,c("window", "estimate")]
+  weight <- rep(NA,nrow(est))
+  for (w in 1:nrow(est)) {
+    weight[w] <- exp(-decayRate*abs(x-est[w,"window"]))
+  }
+  total <- sum(weight)
+  for (w in 1:length(weight)) {
+    weight[w] <- weight[w]/total
+  }
+  expEstimate[x] <- sum(weight*est[,"estimate"])
+  #if(is.na(sum(weight*est[,"estimate"]))){
+  #  print(paste("weight: ", weight))
+  #  print(paste("estimate: ", est[,"estimate"]))
+  #}
+}
+#par(mfrow=c(1,2))
+min <- min(c(ynew, y))
+max <- max(c(ynew, y))
+plot(expEstimate, type="l", col="red", main = paste("with-window likelihood and Exponential Prior, MSE:",sum((expEstimate-y)^2)), ylim = c(min,max))
+lines(y, col="black")
+```
+
+
+##### between-window Likelihood
+
+Naive Prior
+
+```{r warning=FALSE, echo=FALSE}
+BICEstimate <- rep(0,length(ynew))
+for (x in 1:length(ynew)) {
+  #print(paste("x: ", x))
+  prob <- data.frame()
+  lower <- x - windowWidth/2
+  upper <- x + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  BIC <- BICTau.data[c(lower:upper),c("constantBIC","L0BIC")]
+  prob <- cbind("window"=c(lower:upper),exp(BIC)/sum(exp(BIC)))
+  for (w in lower:upper) {
+    estimate <- estimate.data[estimate.data$X==x & estimate.data$window==w,]
+    BICEstimate[x] <- BICEstimate[x] + prob[prob$window==w,"L0BIC"]*estimate$L0Beta + prob[prob$window==w,"constantBIC"]*estimate$constantBeta
+  }
+}
+min <- min(c(BICEstimate, ynew,y))
+max <- max(c(BICEstimate, ynew,y))
+plot(BICEstimate, type="l", col="red", main = paste("Average using between-window Likelihood with Naive Prior, MSE:",sum((BICEstimate-y)^2)), xlab = "coefficients", ylab = "estimates", ylim = c(min,max))
+lines(y, col="black")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+Exponential Prior
+
+```{r warning=FALSE}
+BICEstimate <- rep(0,length(ynew))
+alpha <- 0.01
+for (x in 1:length(ynew)) {
+  #print(paste("x: ", x))
+  prob <- data.frame()
+  lower <- x - windowWidth/2
+  upper <- x + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  BIC <- BICTau.data[c(lower:upper),c("constantBIC","L0BIC")]
+  prob <- cbind("window"=c(lower:upper),exp(BIC)/sum(exp(BIC)))
+  
+  # Exponential Weighting
+  prior <- c(lower:upper)
+  for(i in 1:length(prior)){
+    prior[i] <- exp(-alpha*abs(prior[i]-x))
+  }
+  prior <- prior/sum(prior)
+  
+  for(w in lower:upper){
+    prob[prob$window==w,c("constantBIC","L0BIC")] <- prior[w - lower + 1]*prob[prob$window==w,c("constantBIC","L0BIC")]
+  }
+  prob[,c("constantBIC","L0BIC")] <- prob[,c("constantBIC","L0BIC")]/sum(prob[,c("constantBIC","L0BIC")])
+  
+  for(w in lower:upper) {
+    estimate <- estimate.data[estimate.data$X==x & estimate.data$window==w,]
+    BICEstimate[x] <- BICEstimate[x] + prob[prob$window==w,"constantBIC"]*estimate$constantBeta + prob[prob$window==w,"L0BIC"]*estimate$L0Beta
+  }
+}
+min <- min(c(BICEstimate, ynew,y))
+max <- max(c(BICEstimate, ynew,y))
+plot(BICEstimate, type="l", col="red", main = paste("between-window Likelihood with Exponential Prior, MSE:",sum((BICEstimate-y)^2)), xlab = "coefficients", ylab = "estimates", ylim = c(min,max))
+lines(y, col="black")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+#### Constant with L1
+
+##### with-window likelihood
+
+```{r warning=FALSE}
+prob.data <- data.frame()
+temp <- BICTau.data[,c("constantBIC","L1BIC")]
+for (row in 1:nrow(temp)){
+  #print(row)
+  BIC <- temp[row,]
+  prob <- rep(NA, length(BIC))
+  prob[1] <- exp(BIC[1])/sum(exp(BIC))
+  prob[2] <- exp(BIC[2])/sum(exp(BIC))
+  #prob[3] <- exp(BIC[3])/sum(exp(BIC))
+  #prob[4] <- exp(BIC[4])/sum(exp(BIC))
+  #print(prob)
+  prob.data <- rbind(prob.data,prob)
+}
+colnames(prob.data) <- c("Const","L1")
+rownames(prob.data) <- c(1:nrow(prob.data))
+col <- rep(c("red","blue"),40)
+barplot(t(prob.data),
+        xlab = "Window",
+        ylab = "probability",
+        col = col,
+        legend.text = TRUE,
+        args.legend=list(
+          x=ncol(t(prob.data)) + 35,
+          y=max(colSums(t(prob.data))),
+          bty = "n"
+        ))
+```
+
+
+```{r warning=FALSE, echo=FALSE}
+interWindowAverage.data <- data.frame()
+for (w in 1:length(ynew)) {
+  lower <- w - windowWidth/2
+  upper <- w + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  estimate <- prob.data[w,]$Const*estimate.data[estimate.data$window==w,"constantBeta"] + prob.data[w,]$L1*estimate.data[estimate.data$window==w,"L1Beta"]
+  newrow <- data.frame(
+    "window" = w,
+    "X" = c(lower:upper),
+    "estimate" = estimate[c(lower:upper)]
+  )
+  interWindowAverage.data <- rbind(interWindowAverage.data, newrow)
+}
+```
+
+Naive Prior
+
+```{r warning=FALSE, echo=FALSE}
+simpleEstimate <- rep(NA, length(ynew))
+for(x in 1:length(ynew)){
+  est <- subset(interWindowAverage.data,X==x)[,"estimate"]
+  simpleEstimate[x] <- mean(est)
+}
+#par(mfrow=c(1,2))
+min <- min(c(ynew, y))
+max <- max(c(ynew, y))
+plot(simpleEstimate, type="l", col="red", main = paste("with-window Likelihood with Naive Prior, MSE:",sum((simpleEstimate-y)^2)), xlab="", ylab="", ylim = c(min,max))
+lines(y, col="black")
+#plot(K%*%simpleEstimate, col="red")
+#points(ynew, col="black")
+#points(ynew, col="blue")
+#lines(y, col="blue")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+Exponential Prior
+```{r warning=FALSE}
+decayRate <- 0.1
+expEstimate <- rep(NA, length(ynew))
+for(x in 1:length(ynew)){
+  est <- subset(interWindowAverage.data,X==x)[,c("window", "estimate")]
+  weight <- rep(NA,nrow(est))
+  for (w in 1:nrow(est)) {
+    weight[w] <- exp(-decayRate*abs(x-est[w,"window"]))
+  }
+  total <- sum(weight)
+  for (w in 1:length(weight)) {
+    weight[w] <- weight[w]/total
+  }
+  expEstimate[x] <- sum(weight*est[,"estimate"])
+  #if(is.na(sum(weight*est[,"estimate"]))){
+  #  print(paste("weight: ", weight))
+  #  print(paste("estimate: ", est[,"estimate"]))
+  #}
+}
+#par(mfrow=c(1,2))
+min <- min(c(ynew, y))
+max <- max(c(ynew, y))
+plot(expEstimate, type="l", col="red", main = paste("with-window likelihood and Exponential Prior, MSE:",sum((expEstimate-y)^2)), ylim = c(min,max))
+lines(y, col="black")
+```
+
+
+
+##### between-window Likelihood
+Naive Prior
+```{r warning=FALSE}
+BICEstimate <- rep(0,length(ynew))
+for (x in 1:length(ynew)) {
+  #print(paste("x: ", x))
+  prob <- data.frame()
+  lower <- x - windowWidth/2
+  upper <- x + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  BIC <- BICTau.data[c(lower:upper),c("constantBIC","L1BIC")]
+  prob <- cbind("window"=c(lower:upper),exp(BIC)/sum(exp(BIC)))
+  for (w in lower:upper) {
+    estimate <- estimate.data[estimate.data$X==x & estimate.data$window==w,]
+    BICEstimate[x] <- BICEstimate[x] + prob[prob$window==w,"constantBIC"]*estimate$constantBeta +prob[prob$window==w,"L1BIC"]*estimate$L1Beta
+  }
+}
+min <- min(c(BICEstimate, ynew,y))
+max <- max(c(BICEstimate, ynew,y))
+plot(BICEstimate, type="l", col="red", main = paste("Average using between-window Likelihood with Naive Prior, MSE:",sum((BICEstimate-y)^2)), xlab = "coefficients", ylab = "estimates", ylim = c(min,max))
+lines(y, col="black")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+Exponential Prior
+```{r warning=FALSE}
+BICEstimate <- rep(0,length(ynew))
+alpha <- 0.01
+for (x in 1:length(ynew)) {
+  #print(paste("x: ", x))
+  prob <- data.frame()
+  lower <- x - windowWidth/2
+  upper <- x + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  BIC <- BICTau.data[c(lower:upper),c("constantBIC","L1BIC")]
+  prob <- cbind("window"=c(lower:upper),exp(BIC)/sum(exp(BIC)))
+  
+  # Exponential Weighting
+  prior <- c(lower:upper)
+  for(i in 1:length(prior)){
+    prior[i] <- exp(-alpha*abs(prior[i]-x))
+  }
+  prior <- prior/sum(prior)
+  
+  for(w in lower:upper){
+    prob[prob$window==w,c("constantBIC","L1BIC")] <- prior[w - lower + 1]*prob[prob$window==w,c("constantBIC","L1BIC")]
+  }
+  prob[,c("constantBIC","L1BIC")] <- prob[,c("constantBIC","L1BIC")]/sum(prob[,c("constantBIC","L1BIC")])
+  
+  for(w in lower:upper) {
+    estimate <- estimate.data[estimate.data$X==x & estimate.data$window==w,]
+    BICEstimate[x] <- BICEstimate[x] + prob[prob$window==w,"constantBIC"]*estimate$constantBeta + prob[prob$window==w,"L1BIC"]*estimate$L1Beta
+  }
+}
+min <- min(c(BICEstimate, ynew,y))
+max <- max(c(BICEstimate, ynew,y))
+plot(BICEstimate, type="l", col="red", main = paste("between-window Likelihood with Exponential Prior, MSE:",sum((BICEstimate-y)^2)), xlab = "coefficients", ylab = "estimates", ylim = c(min,max))
+lines(y, col="black")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+#### Constant with L2
+
+##### with-window likelihood
+
+```{r warning=FALSE}
+prob.data <- data.frame()
+temp <- BICTau.data[,c("constantBIC","L2BIC")]
+for (row in 1:nrow(temp)){
+  #print(row)
+  BIC <- temp[row,]
+  prob <- rep(NA, length(BIC))
+  prob[1] <- exp(BIC[1])/sum(exp(BIC))
+  prob[2] <- exp(BIC[2])/sum(exp(BIC))
+  #prob[3] <- exp(BIC[3])/sum(exp(BIC))
+  #prob[4] <- exp(BIC[4])/sum(exp(BIC))
+  #print(prob)
+  prob.data <- rbind(prob.data,prob)
+}
+colnames(prob.data) <- c("Const","L2")
+rownames(prob.data) <- c(1:nrow(prob.data))
+col <- rep(c("red","blue"),40)
+barplot(t(prob.data),
+        xlab = "Window",
+        ylab = "probability",
+        col = col,
+        legend.text = TRUE,
+        args.legend=list(
+          x=ncol(t(prob.data)) + 35,
+          y=max(colSums(t(prob.data))),
+          bty = "n"
+        ))
+```
+
+
+```{r warning=FALSE, echo=FALSE}
+interWindowAverage.data <- data.frame()
+for (w in 1:length(ynew)) {
+  lower <- w - windowWidth/2
+  upper <- w + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  estimate <- prob.data[w,]$Const*estimate.data[estimate.data$window==w,"constantBeta"] + prob.data[w,]$L2*estimate.data[estimate.data$window==w,"L2Beta"]
+  newrow <- data.frame(
+    "window" = w,
+    "X" = c(lower:upper),
+    "estimate" = estimate[c(lower:upper)]
+  )
+  interWindowAverage.data <- rbind(interWindowAverage.data, newrow)
+}
+```
+
+Naive Prior
+
+```{r warning=FALSE, echo=FALSE}
+simpleEstimate <- rep(NA, length(ynew))
+for(x in 1:length(ynew)){
+  est <- subset(interWindowAverage.data,X==x)[,"estimate"]
+  simpleEstimate[x] <- mean(est)
+}
+#par(mfrow=c(1,2))
+min <- min(c(ynew, y))
+max <- max(c(ynew, y))
+plot(simpleEstimate, type="l", col="red", main = paste("with-window Likelihood with Naive Prior, MSE:",sum((simpleEstimate-y)^2)), xlab="", ylab="", ylim = c(min,max))
+lines(y, col="black")
+#plot(K%*%simpleEstimate, col="red")
+#points(ynew, col="black")
+#points(ynew, col="blue")
+#lines(y, col="blue")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+Exponential Prior
+```{r warning=FALSE}
+decayRate <- 0.4
+expEstimate <- rep(NA, length(ynew))
+for(x in 1:length(ynew)){
+  est <- subset(interWindowAverage.data,X==x)[,c("window", "estimate")]
+  weight <- rep(NA,nrow(est))
+  for (w in 1:nrow(est)) {
+    weight[w] <- exp(-decayRate*abs(x-est[w,"window"]))
+  }
+  total <- sum(weight)
+  for (w in 1:length(weight)) {
+    weight[w] <- weight[w]/total
+  }
+  expEstimate[x] <- sum(weight*est[,"estimate"])
+  #if(is.na(sum(weight*est[,"estimate"]))){
+  #  print(paste("weight: ", weight))
+  #  print(paste("estimate: ", est[,"estimate"]))
+  #}
+}
+#par(mfrow=c(1,2))
+min <- min(c(ynew, y))
+max <- max(c(ynew, y))
+plot(expEstimate, type="l", col="red", main = paste("with-window likelihood and Exponential Prior, MSE:",sum((expEstimate-y)^2)), ylim = c(min,max))
+lines(y, col="black")
+```
+
+##### between-window Likelihood
+Naive Prior
+```{r warning=FALSE, cache=TRUE}
+BICEstimate <- rep(0,length(ynew))
+for (x in 1:length(ynew)) {
+  #print(paste("x: ", x))
+  prob <- data.frame()
+  lower <- x - windowWidth/2
+  upper <- x + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  BIC <- BICTau.data[c(lower:upper),c("L2BIC")]
+  prob <- cbind("window"=c(lower:upper),"L2BIC"=exp(BIC)/sum(exp(BIC)))
+  for (w in lower:upper) {
+    estimate <- estimate.data[estimate.data$X==x & estimate.data$window==w,]
+    BICEstimate[x] <- BICEstimate[x] + prob[w-lower+1,2]*estimate$L2Beta
+  }
+}
+min <- min(c(BICEstimate, ynew,y))
+max <- max(c(BICEstimate, ynew,y))
+plot(BICEstimate, type="l", col="red", main = paste("Average using between-window Likelihood with Naive Prior, MSE:",sum((BICEstimate-y)^2)), xlab = "coefficients", ylab = "estimates", ylim = c(min,max))
+lines(y, col="black")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
+
+Exponential Prior
+
+```{r warning=FALSE, cache=TRUE}
+BICEstimate <- rep(0,length(ynew))
+alpha <- 0.01
+for (x in 1:length(ynew)) {
+  #print(paste("x: ", x))
+  prob <- data.frame()
+  lower <- x - windowWidth/2
+  upper <- x + windowWidth/2
+  if(lower < 1){
+    lower <- 1
+  }
+  if(upper > length(ynew)){
+    upper <- length(ynew)
+  }
+  BIC <- BICTau.data[c(lower:upper),c("constantBIC","L2BIC")]
+  prob <- cbind("window"=c(lower:upper),exp(BIC)/sum(exp(BIC)))
+  
+  # Exponential Weighting
+  prior <- c(lower:upper)
+  for(i in 1:length(prior)){
+    prior[i] <- exp(-alpha*abs(prior[i]-x))
+  }
+  prior <- prior/sum(prior)
+  
+  for(w in lower:upper){
+    prob[prob$window==w,c("constantBIC","L2BIC")] <- prior[w - lower + 1]*prob[prob$window==w,c("constantBIC","L2BIC")]
+  }
+  prob[,c("constantBIC","L2BIC")] <- prob[,c("constantBIC","L2BIC")]/sum(prob[,c("constantBIC","L2BIC")])
+  
+  for(w in lower:upper) {
+    estimate <- estimate.data[estimate.data$X==x & estimate.data$window==w,]
+    BICEstimate[x] <- BICEstimate[x] + prob[prob$window==w,"constantBIC"]*estimate$constantBeta + prob[prob$window==w,"L2BIC"]*estimate$L2Beta
+  }
+}
+min <- min(c(BICEstimate, ynew,y))
+max <- max(c(BICEstimate, ynew,y))
+plot(BICEstimate, type="l", col="red", main = paste("between-window Likelihood with Exponential Prior, MSE:",sum((BICEstimate-y)^2)), xlab = "coefficients", ylab = "estimates", ylim = c(min,max))
+lines(y, col="black")
+legend("topleft", legend=c("True", "Estimates"),col=c("black","red"),lty=1, cex=0.8)
+```
